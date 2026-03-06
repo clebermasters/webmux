@@ -15,11 +15,25 @@ use super::{claude_parser, codex_parser, opencode_parser, AiTool, ChatLogEvent, 
 // Log file detection
 // ---------------------------------------------------------------------------
 
+async fn get_pane_id(target: &str) -> Result<String> {
+    let out = Command::new("tmux")
+        .args(&["display-message", "-p", "-t", target, "#{pane_id}"])
+        .output()
+        .await
+        .context("failed to invoke tmux to get pane ID")?;
+    if !out.status.success() {
+        bail!("tmux failed to get pane ID for target {target}: `{:?}`", out);
+    }
+    let s = String::from_utf8(out.stdout).context("tmux gave non-utf8 pane_id")?;
+    Ok(s.trim().to_string())
+}
+
 /// Detect which AI tool is running in the given tmux pane and locate its log
 /// file.  Returns the log path and the detected tool variant.
 pub async fn detect_log_file(session_name: &str, window_index: u32) -> Result<(PathBuf, AiTool)> {
     let target = format!("{session_name}:{window_index}");
     let pane_pid = get_pane_pid(&target).await?;
+    let tmux_pane = get_pane_id(&target).await?;
     let descendants = get_descendant_pids(pane_pid)?;
 
     for pid in &descendants {
@@ -45,12 +59,12 @@ pub async fn detect_log_file(session_name: &str, window_index: u32) -> Result<(P
             let cwd = get_process_cwd(*pid)?;
             let log = find_opencode_db()?;
             info!(
-                "detected Opencode database: {} for PID {} (cwd: {})",
+                "detected Opencode database: {} for tmux_pane {} (cwd: {})",
                 log.display(),
-                pid,
+                tmux_pane,
                 cwd.display()
             );
-            return Ok((log, AiTool::Opencode { cwd, pid: *pid }));
+            return Ok((log, AiTool::Opencode { cwd, tmux_pane }));
         }
     }
 
@@ -80,8 +94,8 @@ pub async fn watch_log_file(
     tool: AiTool,
     event_tx: mpsc::UnboundedSender<ChatLogEvent>,
 ) -> Result<LogWatcher> {
-    if let AiTool::Opencode { cwd, pid } = &tool {
-        return watch_opencode_db(path, cwd, *pid, event_tx).await;
+    if let AiTool::Opencode { cwd, tmux_pane } = &tool {
+        return watch_opencode_db(path, cwd, tmux_pane.clone(), event_tx).await;
     }
     // --- initial history read ---
     let file =
@@ -156,99 +170,107 @@ pub async fn watch_log_file(
 async fn watch_opencode_db(
     db_path: &Path,
     cwd: &Path,
-    pid: u32,
+    tmux_pane: String,
     event_tx: mpsc::UnboundedSender<ChatLogEvent>,
 ) -> Result<LogWatcher> {
-    let mut state = opencode_parser::init_opencode_state(db_path, cwd, pid)?;
-
     let db_path_owned = db_path.to_path_buf();
     let cwd_owned = cwd.to_path_buf();
-    let initial_pid = pid;
+    let tmux_pane_owned = tmux_pane.clone();
 
     info!(
-        "Starting OpenCode watcher for PID {} in directory {}",
-        pid,
+        "Starting OpenCode watcher for tmux_pane {} in directory {}",
+        tmux_pane,
         cwd_owned.display()
     );
 
-    // Small delay to ensure client has subscribed to the channel if this was triggered by a message
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut state = opencode_parser::init_opencode_state_by_pane(&db_path_owned, &cwd_owned, &tmux_pane_owned).ok();
 
-    // Initial fetch for history
-    if let Ok(messages) = opencode_parser::fetch_new_messages(&db_path_owned, &mut state) {
-        info!("Initial fetch got {} messages", messages.len());
-        let _ = event_tx.send(ChatLogEvent::History {
-            messages,
-            tool: AiTool::Opencode {
-                cwd: cwd.to_path_buf(),
-                pid,
-            },
-        });
-    } else {
-        info!("Initial fetch got no messages or error");
+    let mut initial_messages = Vec::new();
+    if let Some(ref mut s) = state {
+        if let Ok(messages) = opencode_parser::fetch_new_messages(&db_path_owned, s) {
+            info!("Initial fetch got {} messages", messages.len());
+            initial_messages = messages;
+        }
     }
+
+    // Always send an initial History event, even if empty, to unblock the Flutter UI loader
+    let _ = event_tx.send(ChatLogEvent::History {
+        messages: initial_messages,
+        tool: AiTool::Opencode {
+            cwd: cwd_owned.clone(),
+            tmux_pane: tmux_pane_owned.clone(),
+        },
+    });
 
     // Polling task
     let handle = tokio::spawn(async move {
-        info!("OpenCode polling task started for PID {}", initial_pid);
+        info!("OpenCode polling task started for tmux_pane {}", tmux_pane_owned);
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
             interval.tick().await;
 
-            // Verify the PID is still running with the same CWD
-            let current_pid_valid = is_process_alive_with_cwd(initial_pid, &cwd_owned);
+            // Always re-query for the latest session — OpenCode may create
+            // a brand-new session for every prompt the user sends.
+            match opencode_parser::init_opencode_state_by_pane(&db_path_owned, &cwd_owned, &tmux_pane_owned) {
+                Ok(new_state) => {
+                    let session_changed = match &state {
+                        Some(s) => s.session_id != new_state.session_id,
+                        None => true,
+                    };
 
-            if !current_pid_valid {
-                // Try to find a new opencode process in the same directory
-                debug!(
-                    "OpenCode PID {} no longer valid, re-detecting session for {}",
-                    initial_pid,
-                    cwd_owned.display()
-                );
+                    if session_changed {
+                        info!(
+                            "Switched to new OpenCode session {} for tmux_pane {}",
+                            new_state.session_id, tmux_pane_owned
+                        );
+                        state = Some(new_state);
 
-                // Re-detect using get_descendant_pids approach to find any opencode in this CWD
-                if let Ok(new_pid) = find_opencode_pid_for_cwd(&cwd_owned) {
-                    match opencode_parser::init_opencode_state(&db_path_owned, &cwd_owned, new_pid)
-                    {
-                        Ok(new_state) => {
-                            debug!("Re-detected OpenCode session with PID {}", new_pid);
-                            state = new_state;
+                        // Fetch all messages from the new session as history
+                        if let Some(ref mut s) = state {
+                            if let Ok(messages) = opencode_parser::fetch_new_messages(&db_path_owned, s) {
+                                if !messages.is_empty() {
+                                    info!("New session: sending {} messages as history", messages.len());
+                                }
+                                let _ = event_tx.send(ChatLogEvent::History {
+                                    messages,
+                                    tool: AiTool::Opencode {
+                                        cwd: cwd_owned.clone(),
+                                        tmux_pane: tmux_pane_owned.clone(),
+                                    },
+                                });
+                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to re-detect OpenCode session: {}", e);
-                            let _ = event_tx.send(ChatLogEvent::Error {
-                                error: format!("OpenCode session re-detection failed: {}", e),
-                            });
-                            continue;
-                        }
+                        continue;
                     }
-                } else {
-                    // No opencode process found - the session might have ended
-                    // Continue polling but don't re-detect
-                    debug!("No OpenCode process found for {}", cwd_owned.display());
+                }
+                Err(_) => {
+                    // No session yet — will retry next tick
+                    continue;
                 }
             }
 
-            match opencode_parser::fetch_new_messages(&db_path_owned, &mut state) {
-                Ok(messages) => {
-                    if !messages.is_empty() {
-                        info!("Polling: got {} new messages", messages.len());
-                    }
-                    for msg in messages {
-                        if event_tx
-                            .send(ChatLogEvent::NewMessage { message: msg })
-                            .is_err()
-                        {
-                            debug!("event_tx closed, stopping opencode polling task");
-                            return;
+            if let Some(ref mut s) = state {
+                match opencode_parser::fetch_new_messages(&db_path_owned, s) {
+                    Ok(messages) => {
+                        if !messages.is_empty() {
+                            info!("Polling: got {} new messages", messages.len());
+                        }
+                        for msg in messages {
+                            if event_tx
+                                .send(ChatLogEvent::NewMessage { message: msg })
+                                .is_err()
+                            {
+                                debug!("event_tx closed, stopping opencode polling task");
+                                return;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    warn!("failed to fetch opencode messages: {}", e);
-                    let _ = event_tx.send(ChatLogEvent::Error {
-                        error: format!("Opencode DB error: {}", e),
-                    });
+                    Err(e) => {
+                        warn!("failed to fetch opencode messages: {}", e);
+                        let _ = event_tx.send(ChatLogEvent::Error {
+                            error: format!("Opencode DB error: {}", e),
+                        });
+                    }
                 }
             }
         }

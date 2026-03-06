@@ -278,14 +278,14 @@ async fn handle_message(msg: WebSocketMessage, state: &mut WsState) -> anyhow::R
                 // Use direct tmux command - this works!
                 let text = data.trim_end_matches('\n');
                 let result = tokio::process::Command::new("tmux")
-                    .args(&["send-keys", "-t", &target, text])
+                    .args(&["send-keys", "-t", &target, "-l", text])
                     .output()
                     .await;
 
                 if result.is_ok() {
-                    // Also send Enter
+                    // Also send Enter (C-m to ensure compatibility in ink/prompts)
                     let _ = tokio::process::Command::new("tmux")
-                        .args(&["send-keys", "-t", &target, "Enter"])
+                        .args(&["send-keys", "-t", &target, "C-m"])
                         .output()
                         .await;
                     debug!("Sent keys via tmux: {:?}", data);
@@ -942,24 +942,62 @@ async fn handle_message(msg: WebSocketMessage, state: &mut WsState) -> anyhow::R
             session_name,
             window_index,
             file,
+            prompt,
         } => {
             info!(
                 "Received file to send to chat: {} ({})",
                 file.filename, file.mime_type
             );
 
-            // Save file to storage
-            let file_id =
+            // Get tmux session working directory
+            let session_path = crate::tmux::get_session_path(&session_name);
+
+            // Save file to session directory if we have a valid path
+            let file_path_str = if let Some(ref session_path) = session_path {
                 match state
                     .chat_file_storage
-                    .save_file(&file.data, &file.filename, &file.mime_type)
-                {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Failed to save file: {}", e);
-                        return Ok(());
+                    .save_file_to_directory(
+                        &file.data,
+                        &file.filename,
+                        &file.mime_type,
+                        session_path,
+                    ) {
+                    Ok(path) => {
+                        info!("File saved to session directory: {:?}", path);
+                        Some(path.to_string_lossy().to_string())
                     }
-                };
+                    Err(e) => {
+                        error!("Failed to save file to session directory: {}", e);
+                        None
+                    }
+                }
+            } else {
+                error!("Could not get session path for {}", session_name);
+                None
+            };
+
+            // Save file to chat_files for display purposes (UUID-based)
+            let file_id = match state
+                .chat_file_storage
+                .save_file(&file.data, &file.filename, &file.mime_type)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Failed to save file for display: {}", e);
+                    return Ok(());
+                }
+            };
+
+            // Build combined text (prompt + file path)
+            let combined_text = match (&prompt, &file_path_str) {
+                (Some(text), Some(path)) if !text.trim().is_empty() => {
+                    format!("{}\n\nHere is the file: {}", text.trim(), path)
+                }
+                (Some(_), Some(path)) => format!("Here is the file: {}", path),
+                (Some(text), None) if !text.trim().is_empty() => text.trim().to_string(),
+                (None, Some(path)) => format!("Here is the file: {}", path),
+                _ => String::new(),
+            };
 
             // Create content block based on mime type
             let block = if file.mime_type.starts_with("image/") {
@@ -979,14 +1017,23 @@ async fn handle_message(msg: WebSocketMessage, state: &mut WsState) -> anyhow::R
                     id: file_id,
                     filename: file.filename.clone(),
                     mime_type: file.mime_type.clone(),
-                    size_bytes: Some((file.data.len() as f64 * 0.75) as u64), // approximate decoded size
+                    size_bytes: Some((file.data.len() as f64 * 0.75) as u64),
                 }
             };
 
+            // Build message blocks: text (if prompt provided) + file
+            let mut blocks = Vec::new();
+            if !combined_text.is_empty() {
+                blocks.push(crate::chat_log::ContentBlock::Text {
+                    text: combined_text,
+                });
+            }
+            blocks.push(block);
+
             let chat_message = crate::chat_log::ChatMessage {
-                role: "assistant".to_string(),
+                role: "user".to_string(),
                 timestamp: Some(chrono::Utc::now()),
-                blocks: vec![block],
+                blocks,
             };
 
             if let Err(e) = state.chat_event_store.append_message(

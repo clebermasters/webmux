@@ -70,7 +70,7 @@ use std::path::PathBuf;
 pub enum AiTool {
     Claude,
     Codex,
-    Opencode { cwd: PathBuf, pid: u32 },
+    Opencode { cwd: PathBuf, tmux_pane: String },
 }
 
 /// Events emitted by the log watcher.
