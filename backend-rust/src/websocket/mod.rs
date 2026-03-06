@@ -1023,6 +1023,7 @@ async fn handle_message(msg: WebSocketMessage, state: &mut WsState) -> anyhow::R
 
             // Build message blocks: text (if prompt provided) + file
             let mut blocks = Vec::new();
+            let combined_text_for_tmux = combined_text.clone();
             if !combined_text.is_empty() {
                 blocks.push(crate::chat_log::ContentBlock::Text {
                     text: combined_text,
@@ -1057,6 +1058,28 @@ async fn handle_message(msg: WebSocketMessage, state: &mut WsState) -> anyhow::R
 
             // Use client_manager.broadcast to send to ALL connected clients
             state.client_manager.broadcast(msg).await;
+
+            // Send the combined text (prompt + file path) to the tmux session
+            // so the AI tool (OpenCode/Claude) actually receives the file reference
+            if !combined_text_for_tmux.is_empty() {
+                let target = format!("{}:{}", session_name, window_index);
+                let text = combined_text_for_tmux.trim_end_matches('\n');
+
+                let result = tokio::process::Command::new("tmux")
+                    .args(&["send-keys", "-t", &target, "-l", text])
+                    .output()
+                    .await;
+
+                if result.is_ok() {
+                    let _ = tokio::process::Command::new("tmux")
+                        .args(&["send-keys", "-t", &target, "C-m"])
+                        .output()
+                        .await;
+                    info!("Sent file prompt to tmux: {:?}", text);
+                } else {
+                    error!("Failed to send file prompt to tmux session {}", target);
+                }
+            }
         }
     }
 
